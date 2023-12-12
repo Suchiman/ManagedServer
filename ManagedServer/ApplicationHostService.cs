@@ -2,14 +2,13 @@
 using Serilog;
 using System.Diagnostics;
 using System.Net.NetworkInformation;
-using System.Reactive.Disposables;
 using System.Reactive.Linq;
 using System.Xml.Linq;
 using Yarp.ReverseProxy.Configuration;
 
 namespace ManagedServer;
 
-class WebApp : IDisposable
+class WebApp : IAsyncDisposable
 {
     public required string Name { get; set; }
     public string ContentRoot { get; set; } = null!;
@@ -69,8 +68,11 @@ class WebApp : IDisposable
         startInfo.Environment["ASPNETCORE_IIS_WEBSOCKETS_SUPPORTED"] = "true";
         Process = Process.Start(startInfo);
 
-        Watcher = new FileSystemWatcher(ContentRoot) { Filters = { "*.dll", "*.exe" } };
-        Watcher.IncludeSubdirectories = true;
+        Watcher = new FileSystemWatcher(ContentRoot)
+        {
+            Filters = { "*.dll", "*.exe" },
+            IncludeSubdirectories = true
+        };
 
         var changed = Observable.FromEventPattern<FileSystemEventHandler, EventArgs>(h => Watcher.Changed += h, h => Watcher.Changed -= h);
         var created = Observable.FromEventPattern<FileSystemEventHandler, EventArgs>(h => Watcher.Created += h, h => Watcher.Created -= h);
@@ -82,10 +84,10 @@ class WebApp : IDisposable
 
         anyEvent.Throttle(TimeSpan.FromSeconds(10))
                 .Take(1)
-                .Subscribe(_ =>
+                .Subscribe(async _ =>
                 {
                     Log.Information("{Name} files have changed, restarting", Name);
-                    Restart();
+                    await RestartAsync();
                 });
 
         Watcher.EnableRaisingEvents = true;
@@ -93,9 +95,9 @@ class WebApp : IDisposable
         return true;
     }
 
-    private void Restart()
+    private async Task RestartAsync()
     {
-        Stop();
+        await StopAsync();
         StartProcess();
     }
 
@@ -112,22 +114,45 @@ class WebApp : IDisposable
         return port;
     }
 
-    public void Stop()
+    public async Task StopAsync()
     {
         Watcher?.Dispose();
         Watcher = null;
+        var client = new HttpClient();
+        var content = new StringContent("");
+        content.Headers.Add("MS-ASPNETCORE-TOKEN", Token);
+        content.Headers.Add("MS-ASPNETCORE-EVENT", "shutdown");
+        var resp = await client.PostAsync($"http://127.0.0.1:{Port}/iisintegration", content);
         if (Process is { } p)
         {
-            p.Kill();
+            var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            if (resp.StatusCode == System.Net.HttpStatusCode.Accepted)
+            {
+                try
+                {
+                    await p.WaitForExitAsync(cts.Token);
+                    Log.Information("{Name} has shutdown peacefully", Name);
+                }
+                catch (OperationCanceledException)
+                {
+                    Log.Information("{Name} did not shutdown in time, killing", Name);
+                    p.Kill();
+                }
+            }
+            else
+            {
+                Log.Information("{Name} did not accept shutdown, killing", Name);
+                p.Kill();
+            }
             p.Close();
             p.Dispose();
             Process = null;
         }
     }
 
-    public void Dispose()
+    public async ValueTask DisposeAsync()
     {
-        Stop();
+        await StopAsync();
     }
 }
 
@@ -147,13 +172,12 @@ internal class ApplicationHostService : BackgroundService
         ServiceProvider = serviceProvider;
     }
 
-    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        ProcessConfiguration();
-        return Task.CompletedTask;
+        await ProcessConfiguration();
     }
 
-    private void ProcessConfiguration()
+    private async Task ProcessConfiguration()
     {
         var managedServer = AppSettings.GetSection("ManagedServer");
 
@@ -163,10 +187,10 @@ internal class ApplicationHostService : BackgroundService
             {
                 observer.OnNext(null);
             }, null);
-        }).Throttle(TimeSpan.FromSeconds(1)).Take(1).Subscribe(x =>
+        }).Throttle(TimeSpan.FromSeconds(1)).Take(1).Subscribe(async x =>
         {
             Log.Information("Configuration changed, reloading");
-            ProcessConfiguration();
+            await ProcessConfiguration();
         });
 
         var children = managedServer.GetChildren();
@@ -187,7 +211,7 @@ internal class ApplicationHostService : BackgroundService
                 if (newApp.ContentRoot != existingApp.ContentRoot || newApp.Kind != existingApp.Kind || newApp.Disabled != existingApp.Disabled)
                 {
                     Log.Information("{Name} configuration changed, restarting", existingApp.Name);
-                    existingApp.Stop();
+                    await existingApp.StopAsync();
                     existingApp.ContentRoot = newApp.ContentRoot;
                     existingApp.Kind = existingApp.Kind;
                     existingApp.Disabled = existingApp.Disabled;
@@ -202,7 +226,7 @@ internal class ApplicationHostService : BackgroundService
             {
                 Log.Information("Stopping removed app {Name}", existingApp!.Name);
                 Apps.Remove(existingApp);
-                existingApp.Dispose();
+                await existingApp.DisposeAsync();
             }
         }
 
